@@ -64,3 +64,18 @@ downloads/
 
 # Old/archive folders
 Old/
+
+# Prevent committing any data folders
+# Note: Git only tracks files, not empty folders
+# These patterns prevent committing folders with data
+data/
+output/
+temp/
+tmp/
+backup/
+backups/
+archive/
+archives/
+logs/
+log/
+*.log
