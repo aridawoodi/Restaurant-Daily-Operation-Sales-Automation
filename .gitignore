@@ -61,3 +61,6 @@ daily_data/
 daily_data_*/
 csv_files/
 downloads/
+
+# Old/archive folders
+Old/
