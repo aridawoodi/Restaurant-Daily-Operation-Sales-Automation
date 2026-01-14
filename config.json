@@ -1,0 +1,17 @@
+{
+  "google_sheet": {
+    "sheet_id": "YOUR_GOOGLE_SHEET_ID_HERE",
+    "date_column": "Date"
+  },
+  "_note": "Sheet ID will be loaded from secrets.json if it exists. See secrets.json.template",
+  "auth_method": "oauth",
+  "credentials_file": "credentials.json",
+  "oauth_credentials_file": "oauth_credentials.json",
+  "oauth_token_file": "token.pickle",
+  "csv_folder": "Sales_Input",
+  "overwrite_behavior": "ask",
+  "test_mode": true,
+  "excel_file": "Restaurant_Daily_Ops_GSheets_Template_Targets.xlsx",
+  "auto_create_columns": true,
+  "test_process_csv_files": ["Sales category summary.csv", "Service Daypart summary.csv", "Payments summary.csv", "Revenue summary.csv", "Check Discounts.csv", "Cash summary.csv"]
+}
