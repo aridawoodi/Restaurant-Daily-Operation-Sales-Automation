@@ -11,7 +11,7 @@
   "csv_folder": "Sales_Input",
   "overwrite_behavior": "ask",
   "test_mode": true,
-  "excel_file": "Restaurant_Daily_Ops_GSheets_Template_Targets.xlsx",
+  "excel_file": "Restaurant_Daily_Ops_GSheets_Template_Targets_v4.xlsx",
   "auto_create_columns": true,
   "test_process_csv_files": ["Sales category summary.csv", "Service Daypart summary.csv", "Payments summary.csv", "Revenue summary.csv", "Check Discounts.csv", "Cash summary.csv"]
 }
