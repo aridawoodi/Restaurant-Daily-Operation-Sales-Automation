@@ -3,6 +3,12 @@
 
 # Excel files - template
 # !Restaurant_Daily_Ops_GSheets_Template_Targets_25_20_15.xlsx
+*.xls
+*.xlsx
+*.xlsm
+
+# Markdown docs
+*.md
 
 # Python
 __pycache__/
@@ -63,6 +69,13 @@ daily_data/
 daily_data_*/
 csv_files/
 downloads/
+
+# Drive cache and app-specific folders
+_drive_cache/
+App Script/
+QuickBook_Input/
+Backups/
+check_github_repo/
 
 # Old/archive folders
 Old/

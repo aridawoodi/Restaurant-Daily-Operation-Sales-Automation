@@ -19,6 +19,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from google.auth.exceptions import GoogleAuthError
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
 import pickle
 import sys
@@ -357,6 +358,37 @@ class CSVToSheetsAutomation:
             raise RuntimeError("Google credentials not initialized. Run authenticate_google_sheets first.")
         self.drive_service = build("drive", "v3", credentials=self.creds, cache_discovery=False)
         return self.drive_service
+
+    def _retry_drive(self, func, *args, **kwargs):
+        """Retry Google Drive calls when rate-limited."""
+        max_retries = self.config.get('drive_max_retries', 5)
+        base_delay = self.config.get('drive_retry_base_seconds', 5)
+
+        last_exception = None
+        for attempt in range(max_retries):
+            try:
+                return func(*args, **kwargs)
+            except HttpError as e:
+                last_exception = e
+                status_code = getattr(e, "status_code", None)
+                if status_code is None and hasattr(e, "resp"):
+                    status_code = getattr(e.resp, "status", None)
+                error_text = str(e)
+                is_rate_limit = status_code in (429, 403) and (
+                    "rateLimitExceeded" in error_text
+                    or "userRateLimitExceeded" in error_text
+                    or "quota" in error_text.lower()
+                    or "429" in error_text
+                )
+                if not is_rate_limit:
+                    raise
+                delay = base_delay * (2 ** attempt)
+                print(f"  {WARNING} Drive rate limit hit. Retrying in {delay} seconds...")
+                time.sleep(delay)
+
+        if last_exception:
+            raise last_exception
+        raise RuntimeError("Drive rate limit retries exhausted")
     
     def _list_drive_children(self, folder_id: str) -> List[Dict]:
         """List files and folders inside a Google Drive folder."""
@@ -365,11 +397,13 @@ class CSVToSheetsAutomation:
         page_token = None
         
         while True:
-            response = service.files().list(
-                q=f"'{folder_id}' in parents and trashed=false",
-                fields="nextPageToken, files(id, name, mimeType)",
-                pageToken=page_token
-            ).execute()
+            response = self._retry_drive(
+                service.files().list(
+                    q=f"'{folder_id}' in parents and trashed=false",
+                    fields="nextPageToken, files(id, name, mimeType)",
+                    pageToken=page_token
+                ).execute
+            )
             items.extend(response.get("files", []))
             page_token = response.get("nextPageToken")
             if not page_token:
@@ -380,14 +414,47 @@ class CSVToSheetsAutomation:
     def _download_drive_file(self, file_id: str, dest_path: Path) -> None:
         """Download a file from Google Drive to a local path."""
         service = self._get_drive_service()
-        request = service.files().get_media(fileId=file_id)
-        dest_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        with open(dest_path, "wb") as f:
-            downloader = MediaIoBaseDownload(f, request)
-            done = False
-            while not done:
-                _, done = downloader.next_chunk()
+        max_retries = self.config.get('drive_max_retries', 5)
+        base_delay = self.config.get('drive_retry_base_seconds', 5)
+
+        last_exception = None
+        for attempt in range(max_retries):
+            try:
+                request = service.files().get_media(fileId=file_id)
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+                with open(dest_path, "wb") as f:
+                    downloader = MediaIoBaseDownload(f, request)
+                    done = False
+                    while not done:
+                        _, done = downloader.next_chunk()
+                return
+            except HttpError as e:
+                last_exception = e
+                if dest_path.exists():
+                    try:
+                        dest_path.unlink()
+                    except OSError:
+                        pass
+                status_code = getattr(e, "status_code", None)
+                if status_code is None and hasattr(e, "resp"):
+                    status_code = getattr(e.resp, "status", None)
+                error_text = str(e)
+                is_rate_limit = status_code in (429, 403) and (
+                    "rateLimitExceeded" in error_text
+                    or "userRateLimitExceeded" in error_text
+                    or "quota" in error_text.lower()
+                    or "429" in error_text
+                )
+                if not is_rate_limit:
+                    raise
+                delay = base_delay * (2 ** attempt)
+                print(f"  {WARNING} Drive rate limit hit. Retrying in {delay} seconds...")
+                time.sleep(delay)
+
+        if last_exception:
+            raise last_exception
+        raise RuntimeError("Drive download retries exhausted")
     
     def _sync_drive_folder_to_local(self, folder_id: str, dest_path: Path, recursive: bool = True, csv_only: bool = True) -> None:
         """Recursively download CSV files from a Drive folder into a local directory."""
@@ -413,13 +480,29 @@ class CSVToSheetsAutomation:
         """Get local cache directory for Drive downloads."""
         return Path(__file__).parent / "_drive_cache"
     
-    def _prepare_sales_input_folder_from_drive(self) -> Path:
-        """Download Sales_Input folder from Google Drive into local cache."""
+    def _prepare_sales_input_folder_from_drive(self, folder_id: Optional[str] = None, folder_name: Optional[str] = None) -> Path:
+        """Download Sales_Input folder (or a specific subfolder) from Google Drive into local cache."""
         if self._drive_sales_cache_path and self._drive_sales_cache_path.exists():
-            return self._drive_sales_cache_path
+            if folder_id and folder_name:
+                target_path = self._drive_sales_cache_path / folder_name
+                if target_path.exists():
+                    return target_path
+            else:
+                return self._drive_sales_cache_path
         
         cache_root = self._prepare_drive_cache_dir()
         sales_cache = cache_root / "Sales_Input"
+        sales_cache.mkdir(parents=True, exist_ok=True)
+
+        if folder_id and folder_name:
+            target_path = sales_cache / folder_name
+            if target_path.exists():
+                shutil.rmtree(target_path)
+            print(f"  Downloading {folder_name} from Google Drive...")
+            self._sync_drive_folder_to_local(folder_id, target_path, recursive=True, csv_only=True)
+            self._drive_sales_cache_path = sales_cache
+            return target_path
+
         if sales_cache.exists():
             shutil.rmtree(sales_cache)
         sales_cache.mkdir(parents=True, exist_ok=True)
@@ -495,17 +578,18 @@ class CSVToSheetsAutomation:
     def get_csv_folder_path(self) -> Path:
         """Get the path to the CSV folder. Auto-detects dated folders (e.g., SalesSummary_2025-12-31_2025-12-31).
         Selects the folder with the latest date in its name, or oldest missing week if process_oldest is True."""
+        # Prepare the base folder (production or test mode)
         if not self.test_mode:
-            return self._prepare_sales_input_folder_from_drive()
-        
-        csv_folder = self.config['csv_folder']
-        base_path = Path(__file__).parent
-        
-        # If absolute path, use it; otherwise relative to script location
-        if os.path.isabs(csv_folder):
-            folder_path = Path(csv_folder)
+            folder_path = self._prepare_sales_input_folder_from_drive()
         else:
-            folder_path = base_path / csv_folder
+            csv_folder = self.config['csv_folder']
+            base_path = Path(__file__).parent
+            
+            # If absolute path, use it; otherwise relative to script location
+            if os.path.isabs(csv_folder):
+                folder_path = Path(csv_folder)
+            else:
+                folder_path = base_path / csv_folder
         
         # If the exact folder exists and contains CSV files directly, use it
         if folder_path.exists() and folder_path.is_dir():
@@ -618,16 +702,31 @@ class CSVToSheetsAutomation:
         return None
     
     def extract_week_ending_date_from_payroll_export(self, csv_file: Path) -> Optional[datetime]:
-        """Extract input date (second date) from PayrollExport CSV filename.
+        """Extract input date from PayrollExport CSV filename.
         
-        Format: PayrollExport_YYYY_MM_DD-YYYY_MM_DD.csv
-        Example: PayrollExport_2025_12_29-2026_01_04.csv -> 2026-01-04
+        Supports two formats:
+        - PayrollExport_YYYY_MM_DD.csv (single date)
+        - PayrollExport_YYYY_MM_DD-YYYY_MM_DD.csv (extract second date - input date)
+        Examples: 
+          PayrollExport_2025_12_30.csv -> 2025-12-30
+          PayrollExport_2025_12_29-2026_01_04.csv -> 2026-01-04
         """
         filename = csv_file.name
         
-        # Pattern: PayrollExport_YYYY_MM_DD-YYYY_MM_DD (extract second date - input date)
-        pattern = r'PayrollExport_\d{4}_\d{2}_\d{2}-(\d{4})_(\d{2})_(\d{2})'
-        match = re.search(pattern, filename)
+        # First try: PayrollExport_YYYY_MM_DD-YYYY_MM_DD (extract second date - input date)
+        pattern_two_dates = r'PayrollExport_\d{4}_\d{2}_\d{2}-(\d{4})_(\d{2})_(\d{2})'
+        match = re.search(pattern_two_dates, filename)
+        
+        if match:
+            year, month, day = match.groups()
+            try:
+                return datetime.strptime(f"{year}-{month}-{day}", "%Y-%m-%d")
+            except ValueError:
+                pass
+        
+        # Second try: PayrollExport_YYYY_MM_DD (single date format)
+        pattern_single_date = r'PayrollExport_(\d{4})_(\d{2})_(\d{2})\.csv'
+        match = re.search(pattern_single_date, filename)
         
         if match:
             year, month, day = match.groups()
@@ -758,14 +857,18 @@ class CSVToSheetsAutomation:
     def find_all_sales_folders_with_dates(self) -> List[Tuple[Path, datetime]]:
         """Find all SalesSummary folders with their input dates.
         Returns a list of (folder_path, input_date) tuples, sorted by date (oldest first)."""
-        csv_folder = self.config['csv_folder']
-        base_path = Path(__file__).parent
-        
-        # If absolute path, use it; otherwise relative to script location
-        if os.path.isabs(csv_folder):
-            folder_path = Path(csv_folder)
+        if self.test_mode:
+            csv_folder = self.config['csv_folder']
+            base_path = Path(__file__).parent
+            
+            # If absolute path, use it; otherwise relative to script location
+            if os.path.isabs(csv_folder):
+                folder_path = Path(csv_folder)
+            else:
+                folder_path = base_path / csv_folder
         else:
-            folder_path = base_path / csv_folder
+            # Production mode pulls Sales_Input from Drive into local cache
+            folder_path = self.get_csv_folder_path()
         
         # Look for folders matching the pattern
         search_dir = folder_path if folder_path.exists() and folder_path.is_dir() else folder_path.parent
@@ -785,6 +888,35 @@ class CSVToSheetsAutomation:
         folders_with_dates.sort(key=lambda x: x[1])
         return folders_with_dates
 
+    def _extract_input_date_from_sales_folder_name(self, folder_name: str) -> Optional[datetime]:
+        """Extract input date (second date) from a SalesSummary folder name."""
+        pattern = r'SalesSummary_\d{4}-\d{2}-\d{2}_(\d{4})-(\d{2})-(\d{2})'
+        match = re.search(pattern, folder_name)
+        if not match:
+            return None
+        year, month, day = match.groups()
+        try:
+            return datetime.strptime(f"{year}-{month}-{day}", "%Y-%m-%d")
+        except ValueError:
+            return None
+
+    def find_all_sales_drive_folders_with_dates(self) -> List[Tuple[str, str, datetime]]:
+        """Find all SalesSummary folders in Drive with their input dates."""
+        items = self._list_drive_children(self.drive_sales_input_id)
+        folders_with_dates = []
+        for item in items:
+            if item.get("mimeType") != "application/vnd.google-apps.folder":
+                continue
+            folder_name = item.get("name", "")
+            if not folder_name.startswith("SalesSummary"):
+                continue
+            input_date = self._extract_input_date_from_sales_folder_name(folder_name)
+            if input_date:
+                folders_with_dates.append((item["id"], folder_name, input_date))
+        
+        folders_with_dates.sort(key=lambda x: x[2])
+        return folders_with_dates
+
     def find_missing_sales_folders(self) -> List[Tuple[Path, datetime]]:
         """Find all SalesSummary folders whose input dates are missing in any sales tab."""
         existing_by_tab = {}
@@ -800,6 +932,24 @@ class CSVToSheetsAutomation:
             input_date_str = input_date.strftime("%Y-%m-%d")
             if any(input_date_str not in existing for existing in existing_by_tab.values()):
                 missing.append((folder, input_date))
+
+        return missing
+
+    def find_missing_sales_drive_folders(self) -> List[Tuple[str, str, datetime]]:
+        """Find all SalesSummary Drive folders whose input dates are missing in any sales tab."""
+        existing_by_tab = {}
+        for tab_name in self.csv_to_tab_mapping.values():
+            existing_by_tab[tab_name] = self.get_all_existing_week_ending_dates(tab_name)
+
+        folders_with_dates = self.find_all_sales_drive_folders_with_dates()
+        if not folders_with_dates:
+            return []
+
+        missing = []
+        for folder_id, folder_name, input_date in folders_with_dates:
+            input_date_str = input_date.strftime("%Y-%m-%d")
+            if any(input_date_str not in existing for existing in existing_by_tab.values()):
+                missing.append((folder_id, folder_name, input_date))
 
         return missing
     
@@ -936,10 +1086,34 @@ class CSVToSheetsAutomation:
         
         return csv_files
     
+    def _read_csv_safe(self, csv_file: Path) -> Optional[pd.DataFrame]:
+        """Read a CSV file safely, returning None if empty or unreadable."""
+        if not csv_file.exists():
+            print(f"  {WARNING} CSV file not found: {csv_file}")
+            return None
+        try:
+            if csv_file.stat().st_size == 0:
+                print(f"  {WARNING} CSV file is empty: {csv_file.name}")
+                return None
+        except OSError as e:
+            print(f"  {WARNING} Could not read CSV file size: {csv_file.name} ({e})")
+            return None
+
+        try:
+            return pd.read_csv(csv_file)
+        except pd.errors.EmptyDataError:
+            print(f"  {WARNING} CSV file has no data: {csv_file.name}")
+            return None
+        except Exception as e:
+            print(f"  {WARNING} Failed to read CSV file {csv_file.name}: {e}")
+            return None
+
     def extract_date_from_csv(self, csv_file: Path) -> Optional[datetime]:
         """Extract date from CSV file content."""
         try:
-            df = pd.read_csv(csv_file)
+            df = self._read_csv_safe(csv_file)
+            if df is None or df.empty:
+                return None
             
             # Check for date column in various formats
             date_columns = [col for col in df.columns 
@@ -1270,7 +1444,9 @@ class CSVToSheetsAutomation:
             return {}
         
         try:
-            df = pd.read_csv(csv_file)
+            df = self._read_csv_safe(csv_file)
+            if df is None or df.empty:
+                return {}
             mapped_data = {}
             
             # Check for special mappings first (category pivot, etc.)
@@ -2518,7 +2694,9 @@ class CSVToSheetsAutomation:
                 worksheet = self.workbook[tab_name]
                 
                 # Read CSV file
-                df = pd.read_csv(csv_file)
+                df = self._read_csv_safe(csv_file)
+                if df is None or df.empty:
+                    return False
                 df = self._filter_total_rows(df, csv_file)
                 
                 # Get Excel headers (row 1)
@@ -2694,7 +2872,9 @@ class CSVToSheetsAutomation:
                     return False
                 
                 # Read CSV file
-                df = pd.read_csv(csv_file)
+                df = self._read_csv_safe(csv_file)
+                if df is None or df.empty:
+                    return False
                 df = self._filter_total_rows(df, csv_file)
                 
                 # Get Google Sheets headers (row 1)
@@ -2999,31 +3179,58 @@ class CSVToSheetsAutomation:
         print("="*70)
         
         # Determine which folders/dates to process
-        if self.process_oldest:
-            oldest_missing = self.find_oldest_missing_sales_folder()
-            if not oldest_missing:
-                target_name = "Excel file" if self.test_mode else "Google Sheet"
-                print(f"\n{CROSS} Could not find oldest missing week.")
-                print(f"  All available weeks may already exist in the {target_name}.")
-                return
-            folders_to_process = [oldest_missing]
-        else:
-            missing_folders = self.find_missing_sales_folders()
-            if missing_folders:
-                folders_to_process = missing_folders
-                print(f"\n  Found {len(folders_to_process)} missing date(s) to process")
-            else:
-                # Fall back to latest folder
-                csv_folder = self.get_csv_folder_path()
-                input_date = self.extract_week_ending_date()
-                if not input_date:
-                    print(f"\n{CROSS} Could not extract input date from folder name.")
-                    print(f"  Expected format: SalesSummary_YYYY-MM-DD_YYYY-MM-DD (start date - end date)")
+        if self.test_mode:
+            if self.process_oldest:
+                missing_folders = self.find_missing_sales_folders()
+                if not missing_folders:
+                    print(f"\n{CROSS} Could not find oldest missing week.")
+                    print(f"  All available weeks may already exist in the Excel file.")
                     return
-                folders_to_process = [(csv_folder, input_date)]
+                folders_to_process = missing_folders
+                print(f"\n  Found {len(folders_to_process)} missing date(s) to process (oldest first)")
+            else:
+                missing_folders = self.find_missing_sales_folders()
+                if missing_folders:
+                    folders_to_process = missing_folders
+                    print(f"\n  Found {len(folders_to_process)} missing date(s) to process")
+                else:
+                    # Fall back to latest folder
+                    csv_folder = self.get_csv_folder_path()
+                    input_date = self.extract_week_ending_date()
+                    if not input_date:
+                        print(f"\n{CROSS} Could not extract input date from folder name.")
+                        print(f"  Expected format: SalesSummary_YYYY-MM-DD_YYYY-MM-DD (start date - end date)")
+                        return
+                    folders_to_process = [(csv_folder, input_date)]
+        else:
+            drive_folders = self.find_all_sales_drive_folders_with_dates()
+            if self.process_oldest:
+                missing_folders = self.find_missing_sales_drive_folders()
+                if not missing_folders:
+                    print(f"\n{CROSS} Could not find oldest missing week.")
+                    print(f"  All available weeks may already exist in the Google Sheet.")
+                    return
+                folders_to_process = missing_folders
+                print(f"\n  Found {len(folders_to_process)} missing date(s) to process (oldest first)")
+            else:
+                missing_folders = self.find_missing_sales_drive_folders()
+                if missing_folders:
+                    folders_to_process = missing_folders
+                    print(f"\n  Found {len(folders_to_process)} missing date(s) to process")
+                else:
+                    if not drive_folders:
+                        print(f"\n{CROSS} No SalesSummary folders found in Drive Sales_Input folder.")
+                        return
+                    folders_to_process = [drive_folders[-1]]
 
         # Process each folder/date
-        for folder_idx, (folder_path, input_date) in enumerate(folders_to_process, 1):
+        for folder_idx, folder_entry in enumerate(folders_to_process, 1):
+            if self.test_mode:
+                folder_path, input_date = folder_entry
+            else:
+                folder_id, folder_name, input_date = folder_entry
+                folder_path = self._prepare_sales_input_folder_from_drive(folder_id, folder_name)
+
             if not folder_path.exists():
                 print(f"\n  {WARNING} Folder does not exist: {folder_path}")
                 continue
@@ -3198,16 +3405,15 @@ class CSVToSheetsAutomation:
         
         # Determine which labor files to process
         if self.process_oldest:
-            # Find oldest missing week
-            oldest_missing = self.find_oldest_missing_labor_csv(labor_input_folder)
-            if oldest_missing:
-                file_to_process, week_ending_date = oldest_missing
-                files_to_process = [(file_to_process, week_ending_date, [])]
-            else:
+            # Find all missing dates (oldest first)
+            missing_files = self.find_missing_labor_csvs(labor_input_folder)
+            if not missing_files:
                 target_name = "Excel file" if self.test_mode else "Google Sheet"
                 print(f"\n{CROSS} Could not find oldest missing PayrollExport CSV file.")
                 print(f"  All available weeks may already exist in the {target_name}.")
                 return
+            files_to_process = missing_files
+            print(f"\n  Found {len(files_to_process)} missing date(s) to process (oldest first)")
         else:
             missing_files = self.find_missing_labor_csvs(labor_input_folder)
             if missing_files:
