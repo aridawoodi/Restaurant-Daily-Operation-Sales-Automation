@@ -9,6 +9,7 @@
 
 # Markdown docs
 *.md
+!README.md
 
 # Python
 __pycache__/
