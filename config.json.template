@@ -1,6 +1,10 @@
 {
   "google_sheet": {
-    "sheet_id": "YOUR_GOOGLE_SHEET_ID_HERE",
+    "sheet_ids": {
+      "primary": "YOUR_GOOGLE_SHEET_ID_HERE",
+      "secondary": "YOUR_SECOND_SHEET_ID_HERE"
+    },
+    "active_sheet": "primary",
     "sheet_name": "daily ops",
     "date_column": "Date"
   },

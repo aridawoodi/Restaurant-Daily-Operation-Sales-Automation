@@ -33,6 +33,21 @@ CHECKMARK = "[OK]" if sys.platform == 'win32' else "{CHECKMARK}"
 WARNING = "[!]" if sys.platform == 'win32' else "⚠"
 CROSS = "[X]" if sys.platform == 'win32' else "{CROSS}"
 
+
+def render_progress(label: str, current: int, total: int, width: int = 20, thickness: int = 5) -> None:
+    if total <= 0:
+        return
+    ratio = min(max(current / total, 0.0), 1.0)
+    filled = int(width * ratio)
+    unit = "█" * max(thickness, 1)
+    empty = "░" * max(thickness, 1)
+    bar = unit * filled + empty * (width - filled)
+    percent = int(ratio * 100)
+    sys.stdout.write(f"\r{label} Progress: [{bar}] {current}/{total} {percent}%")
+    sys.stdout.flush()
+    if current >= total:
+        sys.stdout.write("\n")
+
 # Default Google Drive folder IDs for production input sources
 DRIVE_INPUT_ROOT_ID = "1fr63Bo6L7RBa3ID_shGWFM88SZI6xuPM"
 DRIVE_SALES_INPUT_ID = "1JLIW_mG0xR-Ny0onSNt_QLTAuPsT7wDJ"
@@ -109,6 +124,16 @@ class CSVToSheetsAutomation:
                     if 'google_sheet' not in config:
                         config['google_sheet'] = {}
                     config['google_sheet']['sheet_id'] = secrets['google_sheet_id']
+
+                # Merge optional sheet ID map and active sheet from secrets
+                if 'google_sheet_ids' in secrets and isinstance(secrets['google_sheet_ids'], dict):
+                    if 'google_sheet' not in config:
+                        config['google_sheet'] = {}
+                    config['google_sheet']['sheet_ids'] = secrets['google_sheet_ids']
+                if 'active_sheet' in secrets and secrets['active_sheet']:
+                    if 'google_sheet' not in config:
+                        config['google_sheet'] = {}
+                    config['google_sheet']['active_sheet'] = secrets['active_sheet']
                 
                 # Store email in config for use in error messages
                 if 'email' in secrets and secrets['email'] != 'YOUR_EMAIL_HERE':
@@ -124,11 +149,23 @@ class CSVToSheetsAutomation:
             except Exception as e:
                 print(f"{WARNING} Warning: Could not load secrets.json: {e}")
         
+        # Resolve active sheet selection if configured
+        google_sheet = config.get("google_sheet", {})
+        sheet_ids = google_sheet.get("sheet_ids", {})
+        active_sheet = google_sheet.get("active_sheet")
+        if sheet_ids:
+            if active_sheet not in sheet_ids:
+                raise ValueError("google_sheet.active_sheet must match a key in google_sheet.sheet_ids")
+            google_sheet["sheet_id"] = sheet_ids[active_sheet]
+            config["google_sheet"] = google_sheet
+
         # Validate required config fields
         required_fields = ['google_sheet', 'csv_folder']
         for field in required_fields:
             if field not in config:
                 raise ValueError(f"Missing required configuration field: {field}")
+        if not config.get("google_sheet", {}).get("sheet_id"):
+            raise ValueError("Missing google_sheet.sheet_id (set google_sheet.sheet_ids + active_sheet)")
         
         return config
     
@@ -798,6 +835,7 @@ class CSVToSheetsAutomation:
         Returns a set of date strings in YYYY-MM-DD format.
         Works with both Excel (test_mode) and Google Sheets (production)."""
         existing_dates = set()
+        expected_headers = {'date', 'week_ending_date', 'week ending date'}
         
         if self.test_mode:
             # Excel version
@@ -808,10 +846,17 @@ class CSVToSheetsAutomation:
             
             if worksheet.max_row == 0:
                 return existing_dates
-            
+
+            date_col_index = 1
+            for col_idx in range(1, worksheet.max_column + 1):
+                header_val = worksheet.cell(row=1, column=col_idx).value
+                if header_val and str(header_val).strip().lower() in expected_headers:
+                    date_col_index = col_idx
+                    break
+
             # Check all data rows (starting from row 2)
             for row_idx in range(2, worksheet.max_row + 1):
-                cell_value = worksheet.cell(row=row_idx, column=1).value
+                cell_value = worksheet.cell(row=row_idx, column=date_col_index).value
                 if cell_value is not None:
                     # Convert to string for comparison
                     try:
@@ -820,8 +865,12 @@ class CSVToSheetsAutomation:
                         elif isinstance(cell_value, pd.Timestamp):
                             date_str = cell_value.strftime("%Y-%m-%d")
                         else:
-                            date_str = pd.to_datetime(str(cell_value)).strftime("%Y-%m-%d")
-                        existing_dates.add(date_str)
+                            try:
+                                date_str = pd.to_datetime(str(cell_value)).strftime("%Y-%m-%d")
+                            except Exception:
+                                date_str = str(cell_value).strip()
+                        if date_str:
+                            existing_dates.add(date_str)
                     except:
                         pass
         else:
@@ -833,10 +882,17 @@ class CSVToSheetsAutomation:
                 worksheet = self._get_worksheet(tab_name)
             except gspread.exceptions.WorksheetNotFound:
                 return existing_dates
-            
-            # Get all values from the first column (Date column)
+
+            date_col_index = 1
+            headers = self._get_sheet_headers(tab_name, worksheet)
+            for idx, header in enumerate(headers, start=1):
+                if header and str(header).strip().lower() in expected_headers:
+                    date_col_index = idx
+                    break
+
+            # Get all values from the date column
             try:
-                all_values = self._retry_gspread(worksheet.col_values, 1)  # Column A (index 1)
+                all_values = self._retry_gspread(worksheet.col_values, date_col_index)
                 if len(all_values) <= 1:  # Only header or empty
                     return existing_dates
                 
@@ -845,8 +901,12 @@ class CSVToSheetsAutomation:
                     if cell_value:
                         # Convert to string for comparison
                         try:
-                            cell_str = pd.to_datetime(str(cell_value)).strftime("%Y-%m-%d")
-                            existing_dates.add(cell_str)
+                            try:
+                                cell_str = pd.to_datetime(str(cell_value)).strftime("%Y-%m-%d")
+                            except Exception:
+                                cell_str = str(cell_value).strip()
+                            if cell_str:
+                                existing_dates.add(cell_str)
                         except:
                             pass
             except Exception as e:
@@ -928,10 +988,19 @@ class CSVToSheetsAutomation:
             return []
 
         missing = []
+        self._last_missing_sales_debug = {}
         for folder, input_date in folders_with_dates:
             input_date_str = input_date.strftime("%Y-%m-%d")
             if any(input_date_str not in existing for existing in existing_by_tab.values()):
-                missing.append((folder, input_date))
+                # Double-check using the same logic as processing
+                missing_tabs = []
+                for tab_name in self.csv_to_tab_mapping.values():
+                    exists, _ = self.check_week_ending_exists(tab_name, input_date)
+                    if not exists:
+                        missing_tabs.append(tab_name)
+                if missing_tabs:
+                    self._last_missing_sales_debug[input_date_str] = missing_tabs
+                    missing.append((folder, input_date))
 
         return missing
 
@@ -946,10 +1015,18 @@ class CSVToSheetsAutomation:
             return []
 
         missing = []
+        self._last_missing_sales_debug = {}
         for folder_id, folder_name, input_date in folders_with_dates:
             input_date_str = input_date.strftime("%Y-%m-%d")
             if any(input_date_str not in existing for existing in existing_by_tab.values()):
-                missing.append((folder_id, folder_name, input_date))
+                missing_tabs = []
+                for tab_name in self.csv_to_tab_mapping.values():
+                    exists, _ = self.check_week_ending_exists(tab_name, input_date)
+                    if not exists:
+                        missing_tabs.append(tab_name)
+                if missing_tabs:
+                    self._last_missing_sales_debug[input_date_str] = missing_tabs
+                    missing.append((folder_id, folder_name, input_date))
 
         return missing
     
@@ -991,9 +1068,6 @@ class CSVToSheetsAutomation:
         if not csv_files:
             return None
         
-        # Get all existing dates from Labor_Input tab
-        existing_dates = self.get_all_existing_week_ending_dates("Labor_Input")
-        
         # Extract input dates and sort by date (oldest first)
         files_with_dates = []
         for csv_file in csv_files:
@@ -1009,8 +1083,8 @@ class CSVToSheetsAutomation:
         
         # Find the oldest file whose input date doesn't exist
         for csv_file, input_date in files_with_dates:
-            input_date_str = input_date.strftime("%Y-%m-%d")
-            if input_date_str not in existing_dates:
+            exists, _ = self.check_week_ending_exists("Labor_Input", input_date)
+            if not exists:
                 return (csv_file, input_date)
         
         return None  # All weeks already exist
@@ -1025,8 +1099,6 @@ class CSVToSheetsAutomation:
         if not csv_files:
             return []
 
-        existing_dates = self.get_all_existing_week_ending_dates("Labor_Input")
-
         # Group by input date, track duplicates
         file_date_map = {}
         for csv_file in csv_files:
@@ -1036,15 +1108,17 @@ class CSVToSheetsAutomation:
                 file_date_map.setdefault(input_date_str, []).append(csv_file)
 
         missing = []
+        self._last_missing_labor_debug = set()
         for input_date_str, files in file_date_map.items():
-            if input_date_str in existing_dates:
-                continue
             # Choose latest file by modification time for this date
             files_sorted = sorted(files, key=lambda x: x.stat().st_mtime, reverse=True)
             selected_file = files_sorted[0]
             duplicate_files = files_sorted[1:]
             input_date = datetime.strptime(input_date_str, "%Y-%m-%d")
-            missing.append((selected_file, input_date, duplicate_files))
+            exists, _ = self.check_week_ending_exists("Labor_Input", input_date)
+            if not exists:
+                self._last_missing_labor_debug.add(input_date_str)
+                missing.append((selected_file, input_date, duplicate_files))
 
         # Sort by date (oldest first)
         missing.sort(key=lambda x: x[1])
@@ -2488,23 +2562,20 @@ class CSVToSheetsAutomation:
             week_ending_str = week_ending_date.strftime("%Y-%m-%d")
             row_count = 0
             
-            # Find Date column (should be column A / column 1)
+            # Find Date column
             if worksheet.max_row == 0:
                 return False, 0
             
-            # Check header row for Date column
-            header_cell = worksheet.cell(row=1, column=1).value
-            if header_cell and str(header_cell).strip().lower() not in expected_headers:
-                # If header doesn't match, try to find it
-                for col in range(1, worksheet.max_column + 1):
-                    header_val = worksheet.cell(row=1, column=col).value
-                    if header_val and str(header_val).strip().lower() in expected_headers:
-                        # Found it, but it should be column 1 - continue anyway
-                        break
+            date_col_index = 1
+            for col in range(1, worksheet.max_column + 1):
+                header_val = worksheet.cell(row=1, column=col).value
+                if header_val and str(header_val).strip().lower() in expected_headers:
+                    date_col_index = col
+                    break
             
             # Check all data rows (starting from row 2)
             for row_idx in range(2, worksheet.max_row + 1):
-                cell_value = worksheet.cell(row=row_idx, column=1).value
+                cell_value = worksheet.cell(row=row_idx, column=date_col_index).value
                 if cell_value is not None:
                     # Convert to string for comparison
                     if isinstance(cell_value, datetime):
@@ -2534,9 +2605,16 @@ class CSVToSheetsAutomation:
             week_ending_str = week_ending_date.strftime("%Y-%m-%d")
             row_count = 0
             
-            # Get all values from the first column (Date column)
+            date_col_index = 1
+            headers = self._get_sheet_headers(tab_name, worksheet)
+            for idx, header in enumerate(headers, start=1):
+                if header and str(header).strip().lower() in expected_headers:
+                    date_col_index = idx
+                    break
+
+            # Get all values from the date column
             try:
-                all_values = self._retry_gspread(worksheet.col_values, 1)  # Column A (index 1)
+                all_values = self._retry_gspread(worksheet.col_values, date_col_index)
                 if len(all_values) <= 1:  # Only header or empty
                     return False, 0
                 
@@ -2570,6 +2648,25 @@ class CSVToSheetsAutomation:
                 return False
             else:
                 print(f"      Please enter 'yes' or 'no'")
+
+    def ask_user_to_process_dates(
+        self,
+        date_to_tabs: List[Tuple[str, List[str], List[str]]],
+        label: str,
+    ) -> bool:
+        """Show dates, tabs, and sources, ask user whether to proceed."""
+        print(f"\n  {label} dates found:")
+        for date_str, tabs, sources in date_to_tabs:
+            tabs_label = ", ".join(tabs)
+            sources_label = ", ".join(sources)
+            print(f"    - {date_str} -> {tabs_label} | Sources: {sources_label}")
+        while True:
+            response = input(f"\n  Process these {label.lower()} dates? (yes/no): ").strip().lower()
+            if response in ("yes", "y"):
+                return True
+            if response in ("no", "n"):
+                return False
+            print("  Please enter 'yes' or 'no'")
     
     def delete_rows_with_week_ending(self, tab_name: str, week_ending_date: datetime) -> int:
         """Delete all rows with the given date. Returns number of rows deleted."""
@@ -2674,6 +2771,107 @@ class CSVToSheetsAutomation:
         if removed:
             print(f"      {WARNING} Skipped {removed} Total row(s) in {csv_file.name}")
         return df[~mask].copy()
+
+    def _is_text_header(self, header: str) -> bool:
+        text_tokens = (
+            "name", "title", "department", "employee", "role", "position",
+            "type", "category", "daypart", "job", "class"
+        )
+        header_lower = header.strip().lower()
+        return any(token in header_lower for token in text_tokens)
+
+    def _build_empty_row_values(self, headers: List[str], week_ending_date: datetime, for_google: bool) -> List:
+        values = []
+        date_value = self.format_date_for_sheet(week_ending_date) if for_google else (
+            week_ending_date.date() if hasattr(week_ending_date, 'date') else week_ending_date
+        )
+        expected_headers = {'date', 'week_ending_date', 'week ending date'}
+        for idx, header in enumerate(headers):
+            header_lower = header.strip().lower()
+            if idx == 0 or header_lower in expected_headers:
+                values.append(date_value)
+            elif self._is_text_header(header):
+                values.append("")
+            else:
+                values.append(0)
+        return values
+
+    def _append_empty_row_excel(self, worksheet, tab_name: str, headers: List[str], week_ending_date: datetime) -> bool:
+        if not headers:
+            print(f"  {CROSS} No headers found in tab '{tab_name}'")
+            return False
+        start_row = worksheet.max_row + 1
+        if worksheet.max_row <= 1:
+            start_row = 2
+        row_values = self._build_empty_row_values(headers, week_ending_date, for_google=False)
+
+        for col_idx, value in enumerate(row_values, start=1):
+            cell = worksheet.cell(row=start_row, column=col_idx)
+            if col_idx == 1:
+                cell.value = value
+                cell.number_format = 'yyyy-mm-dd'
+            else:
+                cell.value = value
+
+        if tab_name == "Labor_Input":
+            clasification_col_idx = None
+            job_title_col_idx = None
+            for col_idx, header in enumerate(headers, start=1):
+                header_lower = header.lower()
+                if header_lower in ['clasification', 'classification']:
+                    clasification_col_idx = col_idx
+                if header_lower in ['job title', 'job_title']:
+                    job_title_col_idx = col_idx
+            if clasification_col_idx and job_title_col_idx:
+                job_title_col_letter = get_column_letter(job_title_col_idx)
+                formula = (
+                    f'=IFERROR(VLOOKUP({job_title_col_letter}{start_row}, '
+                    f'Job_Classification_Lookup!$A$2:$B$100, 2, FALSE), "Other")'
+                )
+                clasification_cell = worksheet.cell(row=start_row, column=clasification_col_idx)
+                clasification_cell.value = formula
+                print(f"      {CHECKMARK} Added formula to Clasification column for 1 row")
+
+        print(f"      {WARNING} CSV empty; inserted zero row for {tab_name}")
+        return True
+
+    def _append_empty_row_google(self, worksheet, tab_name: str, headers: List[str], week_ending_date: datetime) -> bool:
+        if not headers:
+            print(f"  {CROSS} No headers found in tab '{tab_name}'")
+            return False
+        row_values = self._build_empty_row_values(headers, week_ending_date, for_google=True)
+
+        all_values = self._retry_gspread(worksheet.get_all_values)
+        start_row = 2 if not all_values or len(all_values) <= 1 else len(all_values) + 1
+        self._retry_gspread(worksheet.append_rows, [row_values], value_input_option='USER_ENTERED')
+
+        if tab_name == "Labor_Input":
+            clasification_col_idx = None
+            job_title_col_idx = None
+            for col_idx, header in enumerate(headers, start=1):
+                header_lower = header.lower()
+                if header_lower in ['clasification', 'classification']:
+                    clasification_col_idx = col_idx
+                if header_lower in ['job title', 'job_title']:
+                    job_title_col_idx = col_idx
+            if clasification_col_idx and job_title_col_idx:
+                job_title_col_letter = self._column_index_to_a1(job_title_col_idx)
+                clasification_col_letter = self._column_index_to_a1(clasification_col_idx)
+                formula = (
+                    f'=IFERROR(VLOOKUP({job_title_col_letter}{start_row}, '
+                    f'Job_Classification_Lookup!$A$2:$B$100, 2, FALSE), "Other")'
+                )
+                cell_range = f"{clasification_col_letter}{start_row}"
+                self._retry_gspread(
+                    worksheet.update,
+                    range_name=cell_range,
+                    values=[[formula]],
+                    value_input_option='USER_ENTERED'
+                )
+                print(f"      {CHECKMARK} Added formula to Clasification column for 1 row")
+
+        print(f"      {WARNING} CSV empty; inserted zero row for {tab_name}")
+        return True
     
     def append_csv_to_excel_tab(self, csv_file: Path, tab_name: str, week_ending_date: datetime) -> bool:
         """Append CSV data directly to Excel tab or Google Sheet, matching headers and adding Date column."""
@@ -2696,8 +2894,10 @@ class CSVToSheetsAutomation:
                 # Read CSV file
                 df = self._read_csv_safe(csv_file)
                 if df is None or df.empty:
-                    return False
+                    return self._append_empty_row_excel(worksheet, tab_name, excel_headers, week_ending_date)
                 df = self._filter_total_rows(df, csv_file)
+                if df.empty:
+                    return self._append_empty_row_excel(worksheet, tab_name, excel_headers, week_ending_date)
                 
                 # Get Excel headers (row 1)
                 excel_headers = []
@@ -2871,17 +3071,19 @@ class CSVToSheetsAutomation:
                         pass
                     return False
                 
-                # Read CSV file
-                df = self._read_csv_safe(csv_file)
-                if df is None or df.empty:
-                    return False
-                df = self._filter_total_rows(df, csv_file)
-                
                 # Get Google Sheets headers (row 1)
                 sheet_headers = self._get_sheet_headers(tab_name, worksheet)
                 if not sheet_headers:
                     print(f"  {CROSS} No headers found in tab '{tab_name}'")
                     return False
+
+                # Read CSV file
+                df = self._read_csv_safe(csv_file)
+                if df is None or df.empty:
+                    return self._append_empty_row_google(worksheet, tab_name, sheet_headers, week_ending_date)
+                df = self._filter_total_rows(df, csv_file)
+                if df.empty:
+                    return self._append_empty_row_google(worksheet, tab_name, sheet_headers, week_ending_date)
                 
                 # Date should be the first column
                 if sheet_headers[0].lower() not in expected_headers:
@@ -3221,10 +3423,29 @@ class CSVToSheetsAutomation:
                     if not drive_folders:
                         print(f"\n{CROSS} No SalesSummary folders found in Drive Sales_Input folder.")
                         return
-                    folders_to_process = [drive_folders[-1]]
+                    print(f"\n  No new sales dates found in the sheet.")
+                    return
 
-        # Process each folder/date
-        for folder_idx, folder_entry in enumerate(folders_to_process, 1):
+        sales_tabs = sorted(set(self.csv_to_tab_mapping.values()))
+        dates_to_confirm = []
+        for folder_entry in folders_to_process:
+            if self.test_mode:
+                folder_path, input_date = folder_entry
+                source_name = folder_path.name
+            else:
+                _, folder_name, input_date = folder_entry
+                source_name = folder_name
+            input_date_str = input_date.strftime("%Y-%m-%d")
+            missing_tabs = getattr(self, "_last_missing_sales_debug", {}).get(input_date_str, sales_tabs)
+            dates_to_confirm.append((input_date_str, missing_tabs, [source_name]))
+
+        if not self.test_mode:
+            if not self.ask_user_to_process_dates(dates_to_confirm, "Sales"):
+                print("\n  [SKIP] User chose not to process sales dates.\n")
+                return
+
+        sales_plan = []
+        for folder_entry in folders_to_process:
             if self.test_mode:
                 folder_path, input_date = folder_entry
             else:
@@ -3239,14 +3460,9 @@ class CSVToSheetsAutomation:
             if not csv_files:
                 continue
 
-            input_date_str = input_date.strftime("%Y-%m-%d")
-            print(f"\n  [{folder_idx}/{len(folders_to_process)}] Date: {input_date_str}")
-
-            # Filter CSV files to only process the 4 mapped files
             files_to_process = []
             for csv_file in csv_files:
-                csv_filename = csv_file.name
-                if csv_filename in self.csv_to_tab_mapping:
+                if csv_file.name in self.csv_to_tab_mapping:
                     files_to_process.append(csv_file)
 
             if not files_to_process:
@@ -3254,6 +3470,17 @@ class CSVToSheetsAutomation:
                 for csv_name in self.csv_to_tab_mapping.keys():
                     print(f"      - {csv_name}")
                 continue
+
+            sales_plan.append((folder_path, input_date, files_to_process))
+
+        total_sales_files = sum(len(files) for _, _, files in sales_plan)
+        sales_progress = 0
+        render_progress("Sales", sales_progress, total_sales_files)
+
+        # Process each folder/date
+        for folder_idx, (folder_path, input_date, files_to_process) in enumerate(sales_plan, 1):
+            input_date_str = input_date.strftime("%Y-%m-%d")
+            print(f"\n  [{folder_idx}/{len(folders_to_process)}] Date: {input_date_str}")
 
             print(f"\n  Files to process: {len(files_to_process)} CSV file(s)\n")
 
@@ -3329,6 +3556,9 @@ class CSVToSheetsAutomation:
                             print(f"      {CHECKMARK} Completed\n")
                     else:
                         print(f"      {CROSS} Failed to append CSV data\n")
+
+                sales_progress += 1
+                render_progress("Sales", sales_progress, total_sales_files)
     
     def ask_user_which_file_to_process(self, latest_file: Path, duplicate_files: List[Path], week_ending_date: datetime) -> Optional[Path]:
         """Ask user which file to process when multiple files exist for the same input date."""
@@ -3420,29 +3650,23 @@ class CSVToSheetsAutomation:
                 files_to_process = missing_files
                 print(f"\n  Found {len(files_to_process)} missing date(s) to process")
             else:
-                # Find latest CSV file (fallback behavior)
-                latest_file, week_ending_date, duplicate_files = self.find_latest_labor_input_csv(labor_input_folder)
-                
-                if not latest_file or not week_ending_date:
-                    print(f"\n{CROSS} Could not find or process latest PayrollExport CSV file.")
-                    return
-                
-                # Check for duplicate files with same input date
-                if duplicate_files:
-                    if self.dry_run:
-                        print(f"\n  [DRY RUN] Would ask user to choose from {len(duplicate_files) + 1} file(s)")
-                        return
-                    
-                    file_to_process = self.ask_user_which_file_to_process(latest_file, duplicate_files, week_ending_date)
-                    
-                    if not file_to_process:
-                        print(f"\n  [SKIP] Skipped (user chose to skip)\n")
-                        return
-                else:
-                    file_to_process = latest_file
-                
-                files_to_process = [(file_to_process, week_ending_date, [])]
+                print(f"\n  No new labor dates found in the sheet.")
+                return
         
+        dates_to_confirm = []
+        for file_to_process, week_ending_date, _ in files_to_process:
+            date_str = week_ending_date.strftime("%Y-%m-%d")
+            tabs = ["Labor_Input"] if date_str in getattr(self, "_last_missing_labor_debug", set()) else []
+            dates_to_confirm.append((date_str, tabs, [file_to_process.name]))
+        if not self.test_mode:
+            if not self.ask_user_to_process_dates(dates_to_confirm, "Labor"):
+                print("\n  [SKIP] User chose not to process labor dates.\n")
+                return
+
+        total_labor_files = len(files_to_process)
+        labor_progress = 0
+        render_progress("Labor", labor_progress, total_labor_files)
+
         # Check if Labor_Input tab exists
         tab_name = "Labor_Input"
         if self.test_mode:
@@ -3519,6 +3743,9 @@ class CSVToSheetsAutomation:
                         print(f"      {CHECKMARK} Completed\n")
                 else:
                     print(f"      {CROSS} Failed to append CSV data\n")
+
+            labor_progress += 1
+            render_progress("Labor", labor_progress, total_labor_files)
     
     def process_all_csv_files(self) -> None:
         """Process both Sales Input CSV files and Labor_Input CSV files."""
@@ -3569,7 +3796,7 @@ class CSVToSheetsAutomation:
         print("ALL PROCESSING COMPLETE!")
         print("="*70)
 
-def show_interactive_menu() -> Tuple[str, str, str]:
+def show_interactive_menu(show_all: bool = False) -> Tuple[str, str, str]:
     """Show interactive menu and return user's choices.
     Returns: (process_type, week_type, mode_type)"""
     print("\n" + "="*70)
@@ -3577,28 +3804,34 @@ def show_interactive_menu() -> Tuple[str, str, str]:
     print("="*70)
     print("\nSelect an option:")
     print()
-    print("  SALES INPUT:")
-    print("    1. Sales + Latest + Testing")
-    print("    2. Sales + Oldest + Testing")
-    print("    3. Sales + Latest + Production")
-    print("    4. Sales + Oldest + Production")
-    print()
-    print("  LABOR INPUT:")
-    print("    5. Labor + Latest + Testing")
-    print("    6. Labor + Oldest + Testing")
-    print("    7. Labor + Latest + Production")
-    print("    8. Labor + Oldest + Production")
-    print()
-    print("  BOTH (Sales + Labor):")
-    print("    9. All + Latest + Testing")
-    print("   10. All + Oldest + Testing")
-    print("   11. All + Latest + Production")
-    print("   12. All + Oldest + Production")
-    print()
+    if show_all:
+        print("  SALES INPUT:")
+        print("    1. Sales + Latest + Testing")
+        print("    2. Sales + Oldest + Testing")
+        print("    3. Sales + Latest + Production")
+        print("    4. Sales + Oldest + Production")
+        print()
+        print("  LABOR INPUT:")
+        print("    5. Labor + Latest + Testing")
+        print("    6. Labor + Oldest + Testing")
+        print("    7. Labor + Latest + Production")
+        print("    8. Labor + Oldest + Production")
+        print()
+        print("  BOTH (Sales + Labor):")
+        print("    9. All + Latest + Testing")
+        print("   10. All + Oldest + Testing")
+        print("   11. All + Latest + Production")
+        print("   12. All + Oldest + Production")
+        print()
+    else:
+        print("  DEFAULT:")
+        print("   11. All + Latest + Production")
+        print()
     
     while True:
         try:
-            choice = input("Enter your choice (1-12): ").strip()
+            prompt = "Enter your choice (1-12): " if show_all else "Enter your choice (11): "
+            choice = input(prompt).strip()
             choice_num = int(choice)
             
             if choice_num == 1:
@@ -3626,7 +3859,10 @@ def show_interactive_menu() -> Tuple[str, str, str]:
             elif choice_num == 12:
                 return ("all", "oldest", "production")
             else:
-                print("  Please enter a number between 1 and 12")
+                if show_all:
+                    print("  Please enter a number between 1 and 12")
+                else:
+                    print("  Please enter 11")
         except ValueError:
             print("  Please enter a valid number")
         except KeyboardInterrupt:
@@ -3636,6 +3872,12 @@ def show_interactive_menu() -> Tuple[str, str, str]:
 def main():
     """Main entry point."""
     import argparse
+    import sys
+    
+    show_all_menu = False
+    if any(arg.lower() in ("help", "help.") for arg in sys.argv[1:]):
+        show_all_menu = True
+        sys.argv = [arg for arg in sys.argv if arg.lower() not in ("help", "help.")]
     
     parser = argparse.ArgumentParser(description='CSV to Google Sheets Automation')
     parser.add_argument('--dry-run', action='store_true', 
@@ -3704,7 +3946,7 @@ def main():
     
     # If no process type specified, show interactive menu
     if process_type is None:
-        process_type, week_type, mode_type_str = show_interactive_menu()
+        process_type, week_type, mode_type_str = show_interactive_menu(show_all=show_all_menu)
         mode_type = True if mode_type_str == "testing" else False
     
     print("="*60)

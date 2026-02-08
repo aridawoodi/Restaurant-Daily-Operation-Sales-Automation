@@ -1,6 +1,10 @@
 {
   "google_sheet": {
-    "sheet_id": "YOUR_GOOGLE_SHEET_ID_HERE",
+    "sheet_ids": {
+      "primary": "YOUR_PRIMARY_SHEET_ID_HERE",
+      "secondary": "YOUR_SECOND_SHEET_ID_HERE"
+    },
+    "active_sheet": "primary",
     "date_column": "Date"
   },
   "_note": "Sheet ID will be loaded from secrets.json if it exists. See secrets.json.template",
